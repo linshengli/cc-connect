@@ -137,6 +137,11 @@ const (
 	MsgVoiceTranscribed     MsgKey = "voice_transcribed"
 	MsgVoiceTranscribeFailed MsgKey = "voice_transcribe_failed"
 	MsgVoiceEmpty           MsgKey = "voice_empty"
+
+	MsgStatsTitle           MsgKey = "stats_title"
+	MsgStatsEmpty           MsgKey = "stats_empty"
+	MsgStatsInfo            MsgKey = "stats_info"
+	MsgStatsNotStarted      MsgKey = "stats_not_started"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -251,6 +256,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/switch <id>\n  Resume an existing session\n\n" +
 			"/current\n  Show current active session\n\n" +
 			"/history [n]\n  Show last n messages (default 10)\n\n" +
+			"/stats\n  Show session statistics\n\n" +
 			"/provider [list|add|remove|switch]\n  Manage API providers\n\n" +
 			"/allow <tool>\n  Pre-allow a tool (next session)\n\n" +
 			"/mode [name]\n  View/switch permission mode\n\n" +
@@ -265,6 +271,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/switch <id>\n  恢复已有会话\n\n" +
 			"/current\n  查看当前活跃会话\n\n" +
 			"/history [n]\n  查看最近 n 条消息（默认 10）\n\n" +
+			"/stats\n  查看会话统计信息\n\n" +
 			"/provider [list|add|remove|switch]\n  管理 API Provider\n\n" +
 			"/allow <工具名>\n  预授权工具（下次会话生效）\n\n" +
 			"/mode [名称]\n  查看/切换权限模式\n\n" +
@@ -379,6 +386,22 @@ var messages = map[MsgKey]map[Language]string{
 	MsgVoiceEmpty: {
 		LangEnglish: "🎙 Voice message was empty or could not be recognized.",
 		LangChinese: "🎙 语音消息为空或无法识别。",
+	},
+	MsgStatsTitle: {
+		LangEnglish: "📊 **Session Statistics**\n\n**Session**: %s\n**Messages**: %d\n**Tools Used**: %d\n**Started**: %s\n**Last Activity**: %s",
+		LangChinese: "📊 **会话统计**\n\n**会话**: %s\n**消息数**: %d\n**工具使用**: %d\n**开始时间**: %s\n**最后活动**: %s",
+	},
+	MsgStatsEmpty: {
+		LangEnglish: "📊 No statistics available for current session.",
+		LangChinese: "📊 当前会话暂无统计数据。",
+	},
+	MsgStatsInfo: {
+		LangEnglish: "\n**Agent Session ID**: `%s`",
+		LangChinese: "\n**Agent Session ID**: `%s`",
+	},
+	MsgStatsNotStarted: {
+		LangEnglish: "(not started)",
+		LangChinese: "(未开始)",
 	},
 }
 

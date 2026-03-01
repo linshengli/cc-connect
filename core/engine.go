@@ -553,6 +553,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) {
 		e.cmdProvider(p, msg, args)
 	case "/stop":
 		e.cmdStop(p, msg)
+	case "/stats":
+		e.cmdStats(p, msg)
 	case "/help":
 		e.cmdHelp(p, msg)
 	default:
@@ -750,6 +752,50 @@ func langDisplayName(lang Language) string {
 
 func (e *Engine) cmdHelp(p Platform, msg *Message) {
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHelp))
+}
+
+func (e *Engine) cmdStats(p Platform, msg *Message) {
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+
+	// Count tool uses from history
+	toolCount := 0
+	for _, entry := range session.History {
+		if entry.Role == "assistant" && strings.Contains(entry.Content, "🔧") {
+			toolCount++
+		}
+	}
+
+	// Calculate message count (user + assistant messages)
+	userMsgs := 0
+	assistantMsgs := 0
+	for _, entry := range session.History {
+		if entry.Role == "user" {
+			userMsgs++
+		} else if entry.Role == "assistant" {
+			assistantMsgs++
+		}
+	}
+
+	if session.CreatedAt.IsZero() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgStatsEmpty))
+		return
+	}
+
+	agentSessionID := session.AgentSessionID
+	if agentSessionID == "" {
+		agentSessionID = e.i18n.T(MsgStatsNotStarted)
+	}
+
+	stats := fmt.Sprintf(e.i18n.T(MsgStatsTitle),
+		session.Name,
+		userMsgs,
+		toolCount,
+		session.CreatedAt.Format("2006-01-02 15:04:05"),
+		session.UpdatedAt.Format("2006-01-02 15:04:05"),
+	)
+	stats += fmt.Sprintf(e.i18n.T(MsgStatsInfo), agentSessionID)
+
+	e.reply(p, msg.ReplyCtx, stats)
 }
 
 func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {
