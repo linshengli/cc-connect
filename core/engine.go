@@ -32,6 +32,9 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+
+	// API call hooks for statistics reporting
+	apiCallHooks []APICallHook
 }
 
 // interactiveState tracks a running interactive agent session and its permission state.
@@ -65,6 +68,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		cancel:            cancel,
 		i18n:              NewI18n(lang),
 		interactiveStates: make(map[string]*interactiveState),
+		apiCallHooks:      make([]APICallHook, 0),
 	}
 }
 
@@ -79,6 +83,37 @@ func (e *Engine) SetLanguageSaveFunc(fn func(Language) error) {
 
 func (e *Engine) SetProviderSaveFunc(fn func(providerName string) error) {
 	e.providerSaveFunc = fn
+}
+
+// AddAPICallHook adds a hook that will be called after each API call.
+// Hooks are useful for reporting API statistics, logging, or monitoring.
+func (e *Engine) AddAPICallHook(hook APICallHook) {
+	e.apiCallHooks = append(e.apiCallHooks, hook)
+}
+
+// callAPICallHooks invokes all registered hooks with the given statistics.
+func (e *Engine) callAPICallHooks(ctx context.Context, sessionID string, stats *APIStats) {
+	for _, hook := range e.apiCallHooks {
+		if err := hook(ctx, sessionID, stats); err != nil {
+			slog.Error("api call hook failed", "error", err, "session_id", sessionID)
+		}
+	}
+
+	// Also send event to update session stats
+	if stats != nil {
+		// Find the active session and update its stats
+		session := e.sessions.GetOrCreateActive(sessionID)
+		if session.APIStats != nil {
+			// Merge stats
+			session.APIStats.TotalCalls++
+			if stats.TotalCalls > 0 {
+				session.APIStats.TotalCalls = stats.TotalCalls
+			}
+			session.APIStats.TokensUsed.PromptTokens += stats.TokensUsed.PromptTokens
+			session.APIStats.TokensUsed.CompletionTokens += stats.TokensUsed.CompletionTokens
+			session.APIStats.TokensUsed.TotalTokens += stats.TokensUsed.TotalTokens
+		}
+	}
 }
 
 func (e *Engine) SetProviderAddSaveFunc(fn func(ProviderConfig) error) {
@@ -367,6 +402,20 @@ func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, repl
 		state = &interactiveState{platform: p, replyCtx: replyCtx}
 		e.interactiveStates[sessionKey] = state
 		return state
+	}
+
+	// Set up API stats hook if the agent session supports it.
+	// Wrap all hooks into a single combined hook.
+	if hookSetter, ok := agentSession.(interface{ SetAPIStatsHook(func(context.Context, string, *APIStats) error) }); ok && len(e.apiCallHooks) > 0 {
+		combinedHook := func(ctx context.Context, sessionID string, stats *APIStats) error {
+			for _, hook := range e.apiCallHooks {
+				if err := hook(ctx, sessionID, stats); err != nil {
+					slog.Error("api call hook failed", "error", err, "session_id", sessionID)
+				}
+			}
+			return nil
+		}
+		hookSetter.SetAPIStatsHook(combinedHook)
 	}
 
 	state = &interactiveState{

@@ -103,3 +103,15 @@ type PermissionModeInfo struct {
 	Desc   string
 	DescZh string
 }
+
+// APIStatsReporter is an optional interface for agents that report API usage statistics.
+// When implemented, the agent should call ReportAPIStats after each API call.
+type APIStatsReporter interface {
+	// ReportAPIStats reports API call statistics after an API call completes.
+	// This is called automatically by the engine after each turn.
+	ReportAPIStats(ctx context.Context, sessionID string, stats *APIStats) error
+}
+
+// APICallHook is a function type for hooking into API calls.
+// It is called after each API call with the statistics.
+type APICallHook func(ctx context.Context, sessionID string, stats *APIStats) error

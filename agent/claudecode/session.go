@@ -37,6 +37,8 @@ type claudeSession struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 	alive       atomic.Bool
+	apiStatsHook func(ctx context.Context, sessionID string, stats *core.APIStats) error // optional hook for API stats
+	lastStats    *core.APIStats // stores last known stats for reporting
 }
 
 func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools []string, extraEnv []string) (*claudeSession, error) {
@@ -103,6 +105,7 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 		ctx:         sessionCtx,
 		cancel:      cancel,
 		done:        make(chan struct{}),
+		lastStats:   &core.APIStats{},
 	}
 	cs.sessionID.Store(sessionID)
 	cs.alive.Store(true)
@@ -249,12 +252,66 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
 	}
-	cs.events <- core.Event{
-		Type:      core.EventResult,
-		Content:   content,
-		SessionID: cs.CurrentSessionID(),
-		Done:      true,
+
+	// Extract usage statistics if available
+	var stats *core.APIStats
+	if usage, ok := raw["usage"].(map[string]any); ok {
+		stats = cs.parseUsage(usage)
+		cs.lastStats = stats
+
+		// Call the API stats hook if registered
+		if cs.apiStatsHook != nil && stats != nil {
+			if err := cs.apiStatsHook(cs.ctx, cs.CurrentSessionID(), stats); err != nil {
+				slog.Error("claudeSession: api stats hook failed", "error", err)
+			}
+		}
 	}
+
+	// Build TokenUsage for event
+	var tokenUsage *core.TokenUsage
+	if stats != nil {
+		tokenUsage = &stats.TokensUsed
+	}
+
+	cs.events <- core.Event{
+		Type:       core.EventResult,
+		Content:    content,
+		SessionID:  cs.CurrentSessionID(),
+		Done:       true,
+		TokenUsage: tokenUsage,
+	}
+}
+
+// parseUsage extracts API statistics from Claude Code CLI usage data.
+func (cs *claudeSession) parseUsage(usage map[string]any) *core.APIStats {
+	stats := &core.APIStats{
+		StartTime:   time.Now(),
+		ProviderStats: make(map[string]*core.ProviderCallStats),
+		ModelStats:    make(map[string]*core.ModelStats),
+		TokensInput:   core.TokensInput{Details: make(map[string]int64)},
+		TokensOutput:  core.TokensOutput{Details: make(map[string]int64)},
+	}
+
+	// Extract token counts
+	if inputTokens, ok := usage["input_tokens"].(float64); ok {
+		stats.TokensUsed.PromptTokens = int64(inputTokens)
+		stats.TokensInput.TextTokens = int64(inputTokens)
+	}
+	if outputTokens, ok := usage["output_tokens"].(float64); ok {
+		stats.TokensUsed.CompletionTokens = int64(outputTokens)
+		stats.TokensOutput.TextTokens = int64(outputTokens)
+	}
+	if cacheRead, ok := usage["cache_read_input_tokens"].(float64); ok {
+		stats.TokensInput.CachedTokens = int64(cacheRead)
+	}
+	if cacheWrite, ok := usage["cache_write_input_tokens"].(float64); ok {
+		stats.TokensInput.Details["cache_write"] = int64(cacheWrite)
+	}
+
+	stats.TokensUsed.TotalTokens = stats.TokensUsed.PromptTokens + stats.TokensUsed.CompletionTokens
+	stats.TotalCalls = 1
+
+	return stats
 }
 
 func (cs *claudeSession) handleControlRequest(raw map[string]any) {
@@ -439,6 +496,18 @@ func (cs *claudeSession) Close() error {
 	cs.cancel()
 	<-cs.done
 	return nil
+}
+
+// SetAPIStatsHook sets a hook function that will be called after each API call.
+// This is used to report API usage statistics to the engine.
+func (cs *claudeSession) SetAPIStatsHook(hook func(ctx context.Context, sessionID string, stats *core.APIStats) error) {
+	cs.apiStatsHook = hook
+}
+
+// GetAPIStatsHook returns the current hook function.
+// This is used for type assertion check.
+func (cs *claudeSession) GetAPIStatsHook() func(ctx context.Context, sessionID string, stats *core.APIStats) error {
+	return cs.apiStatsHook
 }
 
 // filterEnv returns a copy of env with entries matching the given key removed.
