@@ -457,6 +457,8 @@ func TestSandbox_IsPathAllowed(t *testing.T) {
 					WorkDir:    tt.workDir,
 					TempDir:    tt.tempDir,
 				},
+				workDir:   tt.workDir,
+				tempDir:   tt.tempDir,
 			}
 
 			result := s.isPathAllowed(tt.path)
