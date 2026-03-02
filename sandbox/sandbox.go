@@ -903,6 +903,36 @@ func SecureConfig() *Config {
 	}
 }
 
+// NoSandboxConfig returns a configuration without any isolation.
+// WARNING: This is not secure and should only be used in trusted environments.
+func NoSandboxConfig() *Config {
+	return &Config{
+		Timeout:       60 * time.Second,
+		MemoryLimit:   0,                 // No memory limit
+		CPULimit:      0,                 // No CPU limit
+		NetworkAccess: true,              // Full network access
+		FileAccess:    FileAccessFull,    // Full file system access
+		MaxOutputSize: 100 * 1024 * 1024, // 100MB
+		UseDocker:     false,             // No Docker isolation
+		AllowedCmds:   []string{},        // All commands allowed
+	}
+}
+
+// ProcessIsolationConfig returns a configuration with process-level isolation only (no Docker).
+// This provides basic isolation using OS processes without container overhead.
+func ProcessIsolationConfig() *Config {
+	return &Config{
+		Timeout:       30 * time.Second,
+		MemoryLimit:   512 * 1024 * 1024, // 512MB (enforced by OS)
+		CPULimit:      1.0,               // 1 CPU core (enforced by OS)
+		NetworkAccess: false,
+		FileAccess:    FileAccessWorkDirOnly,
+		MaxOutputSize: 10 * 1024 * 1024, // 10MB
+		AllowedCmds:   []string{"ls", "cat", "grep", "find", "go", "python3", "node", "npm"},
+		UseDocker:     false, // No Docker, use process isolation
+	}
+}
+
 // ContainerInfo returns information about the sandbox container.
 type ContainerInfo struct {
 	ID           string `json:"id"`
