@@ -131,17 +131,28 @@ const (
 	MsgProviderRemoved      MsgKey = "provider_removed"
 	MsgProviderRemoveFailed MsgKey = "provider_remove_failed"
 
-	MsgVoiceNotEnabled      MsgKey = "voice_not_enabled"
-	MsgVoiceNoFFmpeg        MsgKey = "voice_no_ffmpeg"
-	MsgVoiceTranscribing    MsgKey = "voice_transcribing"
-	MsgVoiceTranscribed     MsgKey = "voice_transcribed"
+	MsgVoiceNotEnabled       MsgKey = "voice_not_enabled"
+	MsgVoiceNoFFmpeg         MsgKey = "voice_no_ffmpeg"
+	MsgVoiceTranscribing     MsgKey = "voice_transcribing"
+	MsgVoiceTranscribed      MsgKey = "voice_transcribed"
 	MsgVoiceTranscribeFailed MsgKey = "voice_transcribe_failed"
-	MsgVoiceEmpty           MsgKey = "voice_empty"
+	MsgVoiceEmpty            MsgKey = "voice_empty"
 
-	MsgStatsTitle           MsgKey = "stats_title"
-	MsgStatsEmpty           MsgKey = "stats_empty"
-	MsgStatsInfo            MsgKey = "stats_info"
-	MsgStatsNotStarted      MsgKey = "stats_not_started"
+	MsgStatsTitle      MsgKey = "stats_title"
+	MsgStatsEmpty      MsgKey = "stats_empty"
+	MsgStatsInfo       MsgKey = "stats_info"
+	MsgStatsNotStarted MsgKey = "stats_not_started"
+
+	MsgStatsOverview        MsgKey = "stats_overview"
+	MsgStatsToolBreakdown   MsgKey = "stats_tool_breakdown"
+	MsgStatsHourlyActivity  MsgKey = "stats_hourly_activity"
+	MsgStatsSessionDuration MsgKey = "stats_session_duration"
+	MsgStatsEstimatedCost   MsgKey = "stats_estimated_cost"
+	MsgStatsAvgResponseTime MsgKey = "stats_avg_response_time"
+
+	MsgAPIStatsTitle MsgKey = "api_stats_title"
+	MsgAPIStatsEmpty MsgKey = "api_stats_empty"
+	MsgNoAPIStats    MsgKey = "no_api_stats"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -402,6 +413,30 @@ var messages = map[MsgKey]map[Language]string{
 	MsgStatsNotStarted: {
 		LangEnglish: "(not started)",
 		LangChinese: "(未开始)",
+	},
+	MsgStatsOverview: {
+		LangEnglish: "\n\n**Session Overview**:\nDuration: %s\nMessages: %d user / %d assistant\nEstimated Cost: $%.4f\nAvg Response Time: %dms",
+		LangChinese: "\n\n**会话概览**:\n时长：%s\n消息：%d 用户 / %d 助手\n预估成本：$%.4f\n平均响应时间：%dms",
+	},
+	MsgStatsToolBreakdown: {
+		LangEnglish: "\n\n**Tool Usage Breakdown**:\n",
+		LangChinese: "\n\n**工具使用明细**:\n",
+	},
+	MsgStatsHourlyActivity: {
+		LangEnglish: "\n\n**Hourly Activity**:\n",
+		LangChinese: "\n\n**每小时活动**:\n",
+	},
+	MsgAPIStatsTitle: {
+		LangEnglish: "📈 **API Call Statistics**\n\n**Total Calls**: %d\n**Successful**: %d\n**Failed**: %d\n**Prompt Tokens**: %d\n**Completion Tokens**: %d\n**Total Tokens**: %d\n**Start Time**: %s",
+		LangChinese: "📈 **API调用统计**\n\n**总调用次数**: %d\n**成功**: %d\n**失败**: %d\n**提示令牌**: %d\n**补全令牌**: %d\n**总令牌**: %d\n**开始时间**: %s",
+	},
+	MsgAPIStatsEmpty: {
+		LangEnglish: "📈 No API statistics available for current session.",
+		LangChinese: "📈 当前会话暂无API统计信息。",
+	},
+	MsgNoAPIStats: {
+		LangEnglish: "📈 No API statistics collected yet.",
+		LangChinese: "📈 暂未收集到API统计信息。",
 	},
 }
 

@@ -18,9 +18,35 @@ type Session struct {
 	History        []HistoryEntry `json:"history"`
 	CreatedAt      time.Time      `json:"created_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
+	APIStats       *APIStats      `json:"api_stats,omitempty"` // API call statistics
+
+	// Enhanced statistics
+	ToolStats      map[string]*ToolUsageStats `json:"tool_stats,omitempty"` // Per-tool usage stats
+	HourlyStats    map[int]*HourlyStats       `json:"hourly_stats,omitempty"` // Per-hour stats (0-23)
+	AvgResponseMs  int64                      `json:"avg_response_ms,omitempty"` // Average response time in ms
+	TotalCostCents int64                      `json:"total_cost_cents,omitempty"` // Estimated cost in cents
 
 	mu   sync.Mutex `json:"-"`
 	busy bool       `json:"-"`
+}
+
+// ToolUsageStats tracks statistics for a specific tool.
+type ToolUsageStats struct {
+	Name       string    `json:"name"`
+	Calls      int       `json:"calls"`
+	Success    int       `json:"success"`
+	Failures   int       `json:"failures"`
+	TotalMs    int64     `json:"total_ms"`
+	LastUsedAt time.Time `json:"last_used_at"`
+}
+
+// HourlyStats tracks activity per hour.
+type HourlyStats struct {
+	Messages     int `json:"messages"`
+	ToolCalls    int `json:"tool_calls"`
+	APICalls     int `json:"api_calls"`
+	TokenPrompt  int `json:"token_prompt"`
+	TokenOutput  int `json:"token_output"`
 }
 
 func (s *Session) TryLock() bool {
@@ -134,6 +160,16 @@ func (sm *SessionManager) createLocked(userKey, name string) *Session {
 		Name:      name,
 		CreatedAt: now,
 		UpdatedAt: now,
+		APIStats: &APIStats{
+			StartTime:     now,
+			ProviderStats: make(map[string]*ProviderCallStats),
+			ModelStats:    make(map[string]*ModelStats),
+			TokensInput:   TokensInput{Details: make(map[string]int64)},
+			TokensOutput:  TokensOutput{Details: make(map[string]int64)},
+		},
+		ToolStats:   make(map[string]*ToolUsageStats),
+		HourlyStats: make(map[int]*HourlyStats),
+	}
 	}
 	sm.sessions[id] = s
 	sm.activeSession[userKey] = id

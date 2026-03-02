@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -463,6 +464,88 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			<-pending.Resolved
 			slog.Info("permission resolved", "request_id", event.RequestID)
 
+		case EventAPIStats:
+			// Update API statistics if provided
+			if event.APICallStats != nil && session.APIStats != nil {
+				session.APIStats.TotalCalls += event.APICallStats.TotalCalls
+				session.APIStats.SuccessfulCalls += event.APICallStats.SuccessfulCalls
+				session.APIStats.FailedCalls += event.APICallStats.FailedCalls
+
+				// Update token usage
+				session.APIStats.TokensUsed.PromptTokens += event.APICallStats.TokensUsed.PromptTokens
+				session.APIStats.TokensUsed.CompletionTokens += event.APICallStats.TokensUsed.CompletionTokens
+				session.APIStats.TokensUsed.TotalTokens += event.APICallStats.TokensUsed.TotalTokens
+
+				// Update input/output token usage
+				session.APIStats.TokensInput.TextTokens += event.APICallStats.TokensInput.TextTokens
+				session.APIStats.TokensInput.ImageTokens += event.APICallStats.TokensInput.ImageTokens
+				session.APIStats.TokensInput.CachedTokens += event.APICallStats.TokensInput.CachedTokens
+				for k, v := range event.APICallStats.TokensInput.Details {
+					session.APIStats.TokensInput.Details[k] += v
+				}
+
+				session.APIStats.TokensOutput.TextTokens += event.APICallStats.TokensOutput.TextTokens
+				session.APIStats.TokensOutput.ImageTokens += event.APICallStats.TokensOutput.ImageTokens
+				for k, v := range event.APICallStats.TokensOutput.Details {
+					session.APIStats.TokensOutput.Details[k] += v
+				}
+
+				// Update provider stats if available
+				if event.APICallStats.ProviderStats != nil {
+					for providerName, providerStat := range event.APICallStats.ProviderStats {
+						if _, exists := session.APIStats.ProviderStats[providerName]; !exists {
+							session.APIStats.ProviderStats[providerName] = &ProviderCallStats{}
+						}
+						ps := session.APIStats.ProviderStats[providerName]
+						ps.Calls += providerStat.Calls
+						ps.Errors += providerStat.Errors
+						ps.TokensUsed.PromptTokens += providerStat.TokensUsed.PromptTokens
+						ps.TokensUsed.CompletionTokens += providerStat.TokensUsed.CompletionTokens
+						ps.TokensUsed.TotalTokens += providerStat.TokensUsed.TotalTokens
+					}
+				}
+
+				// Update model stats if available
+				if event.APICallStats.ModelStats != nil {
+					for modelName, modelStat := range event.APICallStats.ModelStats {
+						if _, exists := session.APIStats.ModelStats[modelName]; !exists {
+							session.APIStats.ModelStats[modelName] = &ModelStats{
+								ModelName:    modelName,
+								StartTime:    time.Now(),
+								TokensInput:  TokensInput{Details: make(map[string]int64)},
+								TokensOutput: TokensOutput{Details: make(map[string]int64)},
+							}
+						}
+						ms := session.APIStats.ModelStats[modelName]
+						ms.Calls += modelStat.Calls
+						ms.TokensUsed.PromptTokens += modelStat.TokensUsed.PromptTokens
+						ms.TokensUsed.CompletionTokens += modelStat.TokensUsed.CompletionTokens
+						ms.TokensUsed.TotalTokens += modelStat.TokensUsed.TotalTokens
+
+						// Update input tokens for model
+						ms.TokensInput.TextTokens += modelStat.TokensInput.TextTokens
+						ms.TokensInput.ImageTokens += modelStat.TokensInput.ImageTokens
+						ms.TokensInput.CachedTokens += modelStat.TokensInput.CachedTokens
+						for k, v := range modelStat.TokensInput.Details {
+							ms.TokensInput.Details[k] += v
+						}
+
+						// Update output tokens for model
+						ms.TokensOutput.TextTokens += modelStat.TokensOutput.TextTokens
+						ms.TokensOutput.ImageTokens += modelStat.TokensOutput.ImageTokens
+						for k, v := range modelStat.TokensOutput.Details {
+							ms.TokensOutput.Details[k] += v
+						}
+
+						now := time.Now()
+						ms.LastCallTime = &now
+					}
+				}
+
+				now := time.Now()
+				session.APIStats.LastCallTime = &now
+			}
+
 		case EventResult:
 			if event.SessionID != "" {
 				session.AgentSessionID = event.SessionID
@@ -477,6 +560,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			session.AddHistory("assistant", fullResponse)
+
+			// Update token usage if provided in the result event
+			if event.TokenUsage != nil && session.APIStats != nil {
+				session.APIStats.TokensUsed.PromptTokens += event.TokenUsage.PromptTokens
+				session.APIStats.TokensUsed.CompletionTokens += event.TokenUsage.CompletionTokens
+				session.APIStats.TokensUsed.TotalTokens += event.TokenUsage.TotalTokens
+			}
+
 			e.sessions.Save()
 
 			slog.Debug("turn complete",
@@ -555,6 +646,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) {
 		e.cmdStop(p, msg)
 	case "/stats":
 		e.cmdStats(p, msg)
+	case "/apistats", "/api-stats":
+		e.cmdAPIStats(p, msg)
 	case "/help":
 		e.cmdHelp(p, msg)
 	default:
@@ -757,15 +850,26 @@ func (e *Engine) cmdHelp(p Platform, msg *Message) {
 func (e *Engine) cmdStats(p Platform, msg *Message) {
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 
-	// Count tool uses from history
+	// Count tool uses from history with detailed tracking
 	toolCount := 0
+	toolUseMap := make(map[string]int)
 	for _, entry := range session.History {
-		if entry.Role == "assistant" && strings.Contains(entry.Content, "🔧") {
-			toolCount++
+		if entry.Role == "assistant" {
+			if strings.Contains(entry.Content, "🔧") {
+				toolCount++
+				// Extract tool name from content
+				if idx := strings.Index(entry.Content, "**"); idx > 0 {
+					start := idx + 2
+					if end := strings.Index(entry.Content[start:], "**"); end > 0 {
+						toolName := entry.Content[start : start+end]
+						toolUseMap[toolName]++
+					}
+				}
+			}
 		}
 	}
 
-	// Calculate message count (user + assistant messages)
+	// Calculate message count
 	userMsgs := 0
 	assistantMsgs := 0
 	for _, entry := range session.History {
@@ -773,6 +877,44 @@ func (e *Engine) cmdStats(p Platform, msg *Message) {
 			userMsgs++
 		} else if entry.Role == "assistant" {
 			assistantMsgs++
+		}
+	}
+
+	// Calculate session duration
+	duration := session.UpdatedAt.Sub(session.CreatedAt)
+	if duration < 0 {
+		duration = 0
+	}
+
+	// Calculate average response time
+	avgResponseTime := session.AvgResponseMs
+	if avgResponseTime <= 0 && assistantMsgs > 0 && duration > 0 {
+		avgResponseTime = duration.Milliseconds() / int64(assistantMsgs)
+	}
+
+	// Calculate estimated cost (rough estimate: $0.0001 per 1K tokens input, $0.0003 per 1K tokens output)
+	estimatedCost := int64(0)
+	if session.APIStats != nil {
+		inputCost := session.APIStats.TokensUsed.PromptTokens * 1 / 10000000 // $0.01 per 1M tokens
+		outputCost := session.APIStats.TokensUsed.CompletionTokens * 3 / 10000000 // $0.03 per 1M tokens
+		estimatedCost = (inputCost + outputCost) * 100 // Convert to cents
+		if session.TotalCostCents > 0 {
+			estimatedCost = session.TotalCostCents
+		}
+	}
+
+	// Build activity heatmap data
+	hourlyActivity := ""
+	if len(session.HourlyStats) > 0 {
+		hourlyActivity = "\n\n**Hourly Activity**:\n"
+		for hour := 0; hour < 24; hour++ {
+			if hs, ok := session.HourlyStats[hour]; ok && hs.Messages > 0 {
+				bars := ""
+				for i := 0; i < hs.Messages && i < 10; i++ {
+					bars += "▓"
+				}
+				hourlyActivity += fmt.Sprintf("%02d:00 %s (%d msgs)\n", hour, bars, hs.Messages)
+			}
 		}
 	}
 
@@ -786,6 +928,9 @@ func (e *Engine) cmdStats(p Platform, msg *Message) {
 		agentSessionID = e.i18n.T(MsgStatsNotStarted)
 	}
 
+	// Format duration
+	durationStr := formatDuration(duration)
+
 	stats := fmt.Sprintf(e.i18n.T(MsgStatsTitle),
 		session.Name,
 		userMsgs,
@@ -795,7 +940,186 @@ func (e *Engine) cmdStats(p Platform, msg *Message) {
 	)
 	stats += fmt.Sprintf(e.i18n.T(MsgStatsInfo), agentSessionID)
 
+	// Add enhanced statistics
+	stats += fmt.Sprintf("\n\n**Session Overview**:\n"+
+		"Duration: %s\n"+
+		"User Messages: %d | Assistant Messages: %d\n"+
+		"Estimated Cost: $%.4f (%d cents)\n"+
+		"Avg Response Time: %dms",
+		durationStr,
+		userMsgs, assistantMsgs,
+		float64(estimatedCost)/100, estimatedCost,
+		avgResponseTime,
+	)
+
+	// Add tool usage breakdown
+	if len(toolUseMap) > 0 {
+		stats += "\n\n**Tool Usage Breakdown**:\n"
+		for toolName, count := range toolUseMap {
+			stats += fmt.Sprintf("- %s: %d uses\n", toolName, count)
+		}
+	}
+
+	// Add hourly activity
+	if hourlyActivity != "" {
+		stats += hourlyActivity
+	}
+
+	// Add API statistics if available
+	if session.APIStats != nil {
+		stats += fmt.Sprintf("\n\n📈 **API Statistics**:\n"+
+			"Total Calls: %d (Success: %d, Failed: %d)\n"+
+			"Tokens: %d (Prompt: %d, Completion: %d)",
+			session.APIStats.TotalCalls,
+			session.APIStats.SuccessfulCalls,
+			session.APIStats.FailedCalls,
+			session.APIStats.TokensUsed.TotalTokens,
+			session.APIStats.TokensUsed.PromptTokens,
+			session.APIStats.TokensUsed.CompletionTokens,
+		)
+
+		// Add input/output token details
+		stats += fmt.Sprintf("\nInput Tokens: %d (Text: %d, Image: %d, Cached: %d)",
+			session.APIStats.TokensInput.TextTokens+session.APIStats.TokensInput.ImageTokens,
+			session.APIStats.TokensInput.TextTokens,
+			session.APIStats.TokensInput.ImageTokens,
+			session.APIStats.TokensInput.CachedTokens,
+		)
+
+		stats += fmt.Sprintf("\nOutput Tokens: %d (Text: %d, Image: %d)",
+			session.APIStats.TokensOutput.TextTokens+session.APIStats.TokensOutput.ImageTokens,
+			session.APIStats.TokensOutput.TextTokens,
+			session.APIStats.TokensOutput.ImageTokens,
+		)
+
+		// Add provider details if available
+		if len(session.APIStats.ProviderStats) > 0 {
+			stats += "\n**Providers**:\n"
+			for provider, provStats := range session.APIStats.ProviderStats {
+				stats += fmt.Sprintf("- %s: %d calls, %d errors, %d tokens\n",
+					provider, provStats.Calls, provStats.Errors, provStats.TokensUsed.TotalTokens)
+			}
+		}
+
+		// Add model details if available
+		if len(session.APIStats.ModelStats) > 0 {
+			stats += "\n**Models**:\n"
+			for modelName, modelStats := range session.APIStats.ModelStats {
+				stats += fmt.Sprintf("- %s: %d calls, %d/%d/%d tokens (in/out/total)\n",
+					modelName,
+					modelStats.Calls,
+					modelStats.TokensInput.TextTokens+modelStats.TokensInput.ImageTokens,
+					modelStats.TokensOutput.TextTokens+modelStats.TokensOutput.ImageTokens,
+					modelStats.TokensUsed.TotalTokens,
+				)
+			}
+		}
+
+		// Add last call time if available
+		if session.APIStats.LastCallTime != nil {
+			stats += fmt.Sprintf("\nLast API Call: %s", session.APIStats.LastCallTime.Format("2006-01-02 15:04:05"))
+		}
+	}
+
 	e.reply(p, msg.ReplyCtx, stats)
+}
+
+func (e *Engine) cmdAPIStats(p Platform, msg *Message) {
+	session := e.sessions.GetOrCreateActive(msg.SessionKey)
+
+	if session.APIStats == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNoAPIStats))
+		return
+	}
+
+	// Format the API statistics
+	stats := fmt.Sprintf(e.i18n.T(MsgAPIStatsTitle),
+		session.APIStats.TotalCalls,
+		session.APIStats.SuccessfulCalls,
+		session.APIStats.FailedCalls,
+		session.APIStats.TokensUsed.PromptTokens,
+		session.APIStats.TokensUsed.CompletionTokens,
+		session.APIStats.TokensUsed.TotalTokens,
+		session.APIStats.StartTime.Format("2006-01-02 15:04:05"),
+	)
+
+	// Add input/output token details
+	stats += fmt.Sprintf("\n\n**Input Tokens**: %d (Text: %d, Image: %d, Cached: %d)",
+		session.APIStats.TokensInput.TextTokens+session.APIStats.TokensInput.ImageTokens,
+		session.APIStats.TokensInput.TextTokens,
+		session.APIStats.TokensInput.ImageTokens,
+		session.APIStats.TokensInput.CachedTokens,
+	)
+
+	if len(session.APIStats.TokensInput.Details) > 0 {
+		stats += "\nInput Details:"
+		for k, v := range session.APIStats.TokensInput.Details {
+			stats += fmt.Sprintf(" %s:%d", k, v)
+		}
+	}
+
+	stats += fmt.Sprintf("\n**Output Tokens**: %d (Text: %d, Image: %d)",
+		session.APIStats.TokensOutput.TextTokens+session.APIStats.TokensOutput.ImageTokens,
+		session.APIStats.TokensOutput.TextTokens,
+		session.APIStats.TokensOutput.ImageTokens,
+	)
+
+	if len(session.APIStats.TokensOutput.Details) > 0 {
+		stats += "\nOutput Details:"
+		for k, v := range session.APIStats.TokensOutput.Details {
+			stats += fmt.Sprintf(" %s:%d", k, v)
+		}
+	}
+
+	// Add provider details if available
+	if len(session.APIStats.ProviderStats) > 0 {
+		stats += "\n\n**Provider Details**:\n"
+		for provider, provStats := range session.APIStats.ProviderStats {
+			stats += fmt.Sprintf("- %s: %d calls, %d errors, %d tokens (Prompt: %d, Completion: %d)\n",
+				provider,
+				provStats.Calls,
+				provStats.Errors,
+				provStats.TokensUsed.TotalTokens,
+				provStats.TokensUsed.PromptTokens,
+				provStats.TokensUsed.CompletionTokens,
+			)
+		}
+	}
+
+	// Add model details if available
+	if len(session.APIStats.ModelStats) > 0 {
+		stats += "\n\n**Model Details**:\n"
+		for modelName, modelStats := range session.APIStats.ModelStats {
+			stats += fmt.Sprintf("- %s: %d calls, %d/%d/%d tokens (in/out/total)\n",
+				modelName,
+				modelStats.Calls,
+				modelStats.TokensInput.TextTokens+modelStats.TokensInput.ImageTokens,
+				modelStats.TokensOutput.TextTokens+modelStats.TokensOutput.ImageTokens,
+				modelStats.TokensUsed.TotalTokens,
+			)
+		}
+	}
+
+	// Add last call time if available
+	if session.APIStats.LastCallTime != nil {
+		stats += fmt.Sprintf("\n**Last API Call**: %s", session.APIStats.LastCallTime.Format("2006-01-02 15:04:05"))
+	}
+
+	e.reply(p, msg.ReplyCtx, stats)
+}
+
+// formatDuration formats a duration into human-readable string.
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 func (e *Engine) cmdMode(p Platform, msg *Message, args []string) {

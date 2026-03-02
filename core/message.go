@@ -40,6 +40,7 @@ const (
 	EventError             EventType = "error"              // error occurred
 	EventPermissionRequest EventType = "permission_request" // agent requests permission via stdio protocol
 	EventThinking          EventType = "thinking"           // thinking/processing status
+	EventAPIStats          EventType = "api_stats"          // API call statistics
 )
 
 // Event represents a single piece of agent output streamed back to the engine.
@@ -52,6 +53,9 @@ type Event struct {
 	ToolResult   string         // populated for EventToolResult
 	SessionID    string         // agent-managed session ID for conversation continuity
 	RequestID    string         // unique request ID for EventPermissionRequest
+	// API statistics fields (populated for EventAPIStats)
+	APICallStats *APIStats   `json:"api_call_stats,omitempty"`
+	TokenUsage   *TokenUsage `json:"token_usage,omitempty"`
 	Done         bool
 	Error        error
 }
@@ -70,4 +74,59 @@ type AgentSessionInfo struct {
 	MessageCount int
 	ModifiedAt   time.Time
 	GitBranch    string
+}
+
+// APIStats holds API call statistics for a session.
+type APIStats struct {
+	TotalCalls      int64                         `json:"total_calls"`
+	SuccessfulCalls int64                         `json:"successful_calls"`
+	FailedCalls     int64                         `json:"failed_calls"`
+	TokensUsed      TokenUsage                    `json:"tokens_used"`
+	TokensInput     TokensInput                   `json:"tokens_input"`
+	TokensOutput    TokensOutput                  `json:"tokens_output"`
+	StartTime       time.Time                     `json:"start_time"`
+	LastCallTime    *time.Time                    `json:"last_call_time,omitempty"`
+	ProviderStats   map[string]*ProviderCallStats `json:"provider_stats"`
+	ModelStats      map[string]*ModelStats        `json:"model_stats"` // Statistics grouped by model
+}
+
+// TokenUsage represents token consumption statistics.
+type TokenUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+}
+
+// TokensInput represents input token usage statistics.
+type TokensInput struct {
+	TextTokens   int64            `json:"text_tokens"`
+	ImageTokens  int64            `json:"image_tokens"`
+	CachedTokens int64            `json:"cached_tokens"`
+	Details      map[string]int64 `json:"details,omitempty"` // Additional input token details
+}
+
+// TokensOutput represents output token usage statistics.
+type TokensOutput struct {
+	TextTokens  int64            `json:"text_tokens"`
+	ImageTokens int64            `json:"image_tokens"`
+	Details     map[string]int64 `json:"details,omitempty"` // Additional output token details
+}
+
+// ProviderCallStats holds statistics for a specific provider.
+type ProviderCallStats struct {
+	Calls           int64      `json:"calls"`
+	Errors          int64      `json:"errors"`
+	TokensUsed      TokenUsage `json:"tokens_used"`
+	AvgResponseTime float64    `json:"avg_response_time"` // in seconds
+}
+
+// ModelStats holds statistics for a specific model.
+type ModelStats struct {
+	ModelName    string       `json:"model_name"`
+	Calls        int64        `json:"calls"`
+	TokensUsed   TokenUsage   `json:"tokens_used"`
+	TokensInput  TokensInput  `json:"tokens_input"`
+	TokensOutput TokensOutput `json:"tokens_output"`
+	StartTime    time.Time    `json:"start_time"`
+	LastCallTime *time.Time   `json:"last_call_time,omitempty"`
 }
