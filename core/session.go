@@ -170,7 +170,6 @@ func (sm *SessionManager) createLocked(userKey, name string) *Session {
 		ToolStats:   make(map[string]*ToolUsageStats),
 		HourlyStats: make(map[int]*HourlyStats),
 	}
-	}
 	sm.sessions[id] = s
 	sm.activeSession[userKey] = id
 	sm.userSessions[userKey] = append(sm.userSessions[userKey], id)
