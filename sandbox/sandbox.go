@@ -1,10 +1,13 @@
 // Package sandbox provides a safe execution environment for running
-// untrusted code and commands with resource limits and isolation.
+// untrusted code and commands with resource limits and isolation using Docker containers.
 package sandbox
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,13 +23,16 @@ type Config struct {
 	WorkDir       string            // Working directory for execution
 	Timeout       time.Duration     // Max execution time
 	MemoryLimit   int64             // Memory limit in bytes (0 = unlimited)
-	CPULimit      float64           // CPU limit (0 = unlimited)
+	CPULimit      float64           // CPU limit (0 = unlimited, 1.0 = 1 CPU core)
 	NetworkAccess bool              // Allow network access
 	EnvWhitelist  []string          // Allowed environment variables
 	FileAccess    FileAccessMode    // File access mode
 	AllowedCmds   []string          // Allowed commands (empty = all)
 	MaxOutputSize int64             // Max output size in bytes
 	TempDir       string            // Directory for temp files
+	UseDocker     bool              // Use Docker container for isolation
+	DockerImage   string            // Docker image to use (default: alpine)
+	ContainerID   string            // Container ID if using existing container
 }
 
 // FileAccessMode defines file access restrictions.
@@ -47,16 +53,32 @@ type Result struct {
 	Duration   time.Duration
 	TimedOut   bool
 	MemoryUsed int64
+	CPUUsed    float64
 	Error      error
 }
 
-// Sandbox provides isolated execution environment.
+// Sandbox provides isolated execution environment using Docker containers.
 type Sandbox struct {
-	config *Config
-	mu     sync.Mutex
+	config      *Config
+	mu          sync.Mutex
+	containerID string
+	workDir     string
+	tempDir     string
+	cleanupFunc func()
 }
 
-// New creates a new sandbox.
+// DockerConfig represents Docker container configuration.
+type DockerConfig struct {
+	Image       string
+	MemoryLimit string
+	CPULimit    string
+	Network     string
+	WorkDir     string
+	Binds       []string
+	Env         []string
+}
+
+// New creates a new sandbox with optional Docker container isolation.
 func New(cfg *Config) (*Sandbox, error) {
 	if cfg == nil {
 		cfg = &Config{}
@@ -72,6 +94,13 @@ func New(cfg *Config) (*Sandbox, error) {
 	if cfg.TempDir == "" {
 		cfg.TempDir = os.TempDir()
 	}
+	if cfg.DockerImage == "" {
+		cfg.DockerImage = "alpine:latest"
+	}
+	if cfg.UseDocker && !isDockerAvailable() {
+		// Fall back to process isolation if Docker is not available
+		cfg.UseDocker = false
+	}
 
 	// Create temp dir for this sandbox
 	sandboxDir, err := os.MkdirTemp(cfg.TempDir, "sandbox-*")
@@ -84,9 +113,133 @@ func New(cfg *Config) (*Sandbox, error) {
 		cfg.WorkDir = sandboxDir
 	}
 
-	return &Sandbox{
-		config: cfg,
-	}, nil
+	s := &Sandbox{
+		config:  cfg,
+		tempDir: sandboxDir,
+		workDir: cfg.WorkDir,
+	}
+
+	// Initialize Docker container if requested
+	if cfg.UseDocker {
+		if err := s.initDockerContainer(); err != nil {
+			// Fall back to process isolation
+			cfg.UseDocker = false
+		}
+	}
+
+	return s, nil
+}
+
+// isDockerAvailable checks if Docker daemon is running and accessible.
+func isDockerAvailable() bool {
+	cmd := exec.Command("docker", "info", "--format", "{{.ServerVersion}}")
+	err := cmd.Run()
+	return err == nil
+}
+
+// initDockerContainer creates and starts a Docker container.
+func (s *Sandbox) initDockerContainer() error {
+	dockerCfg := s.buildDockerConfig()
+
+	// Build docker run command
+	args := []string{
+		"run",
+		"-d", // Detached mode
+		"--rm", // Auto cleanup
+		"--workdir", dockerCfg.WorkDir,
+	}
+
+	// Add memory limit
+	if s.config.MemoryLimit > 0 {
+		args = append(args, "--memory", formatMemoryLimit(s.config.MemoryLimit))
+	}
+
+	// Add CPU limit
+	if s.config.CPULimit > 0 {
+		args = append(args, "--cpus", fmt.Sprintf("%.2f", s.config.CPULimit))
+	}
+
+	// Network configuration
+	if !s.config.NetworkAccess {
+		args = append(args, "--network", "none")
+	} else {
+		args = append(args, "--network", "bridge")
+	}
+
+	// Mount work directory
+	args = append(args, "-v", fmt.Sprintf("%s:%s", s.workDir, dockerCfg.WorkDir))
+
+	// Mount temp directory for temporary files
+	args = append(args, "-v", fmt.Sprintf("%s:/tmp", s.tempDir))
+
+	// Security options
+	args = append(args,
+		"--cap-drop=ALL", // Drop all capabilities
+		"--read-only",    // Read-only root filesystem
+		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+		"--tmpfs", "/var/tmp:rw,noexec,nosuid,size=16m",
+	)
+
+	// Add image and command
+	args = append(args, dockerCfg.Image)
+	args = append(args, "sleep", "infinity") // Keep container running
+
+	cmd := exec.Command("docker", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to create container: %w", err)
+	}
+
+	s.containerID = strings.TrimSpace(string(output))
+	return nil
+}
+
+// buildDockerConfig builds Docker configuration from sandbox config.
+func (s *Sandbox) buildDockerConfig() *DockerConfig {
+	cfg := &DockerConfig{
+		Image:   s.config.DockerImage,
+		WorkDir: "/workspace",
+		Env:     s.filterEnv(),
+		Binds: []string{
+			fmt.Sprintf("%s:%s", s.workDir, "/workspace"),
+		},
+	}
+
+	if s.config.MemoryLimit > 0 {
+		cfg.MemoryLimit = formatMemoryLimit(s.config.MemoryLimit)
+	}
+
+	if s.config.CPULimit > 0 {
+		cfg.CPULimit = fmt.Sprintf("%.2f", s.config.CPULimit)
+	}
+
+	if s.config.NetworkAccess {
+		cfg.Network = "bridge"
+	} else {
+		cfg.Network = "none"
+	}
+
+	return cfg
+}
+
+// formatMemoryLimit converts bytes to Docker memory format.
+func formatMemoryLimit(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+
+	if bytes >= GB {
+		return fmt.Sprintf("%.1fg", float64(bytes)/GB)
+	}
+	if bytes >= MB {
+		return fmt.Sprintf("%.1fm", float64(bytes)/MB)
+	}
+	if bytes >= KB {
+		return fmt.Sprintf("%.1fk", float64(bytes)/KB)
+	}
+	return fmt.Sprintf("%d", bytes)
 }
 
 // Run executes a command in the sandbox.
@@ -106,6 +259,99 @@ func (s *Sandbox) Run(ctx context.Context, name string, args ...string) (*Result
 		defer cancel()
 	}
 
+	startTime := time.Now()
+
+	var result *Result
+	var err error
+
+	if s.config.UseDocker && s.containerID != "" {
+		result, err = s.runInDocker(ctx, name, args)
+	} else {
+		result, err = s.runInProcess(ctx, name, args)
+	}
+
+	if result != nil {
+		result.Duration = time.Since(startTime)
+	}
+
+	return result, err
+}
+
+// runInDocker executes a command inside a Docker container.
+func (s *Sandbox) runInDocker(ctx context.Context, name string, args []string) (*Result, error) {
+	// Build docker exec command
+	execArgs := []string{
+		"exec",
+		"-i", // Interactive
+		"-w", "/workspace",
+	}
+
+	// Add environment variables
+	for _, env := range s.filterEnv() {
+		execArgs = append(execArgs, "-e", env)
+	}
+
+	execArgs = append(execArgs, s.containerID)
+	execArgs = append(execArgs, name)
+	execArgs = append(execArgs, args...)
+
+	cmd := exec.CommandContext(ctx, "docker", execArgs...)
+
+	// Create pipes for stdout/stderr
+	stdoutBuf := &bytes.Buffer{}
+	stderrBuf := &bytes.Buffer{}
+
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
+
+	// Set process group for cleanup
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	// Start command
+	if err := cmd.Start(); err != nil {
+		return &Result{
+			ExitCode: -1,
+			Error:    fmt.Errorf("failed to start: %w", err),
+			TimedOut: ctx.Err() == context.DeadlineExceeded,
+		}, nil
+	}
+
+	// Wait for completion
+	err := cmd.Wait()
+
+	result := &Result{
+		Stdout: stdoutBuf.Bytes(),
+		Stderr: stderrBuf.Bytes(),
+	}
+
+	// Check for timeout
+	if ctx.Err() == context.DeadlineExceeded {
+		result.TimedOut = true
+		result.Error = fmt.Errorf("command timed out after %v", s.config.Timeout)
+	}
+
+	// Get exit code
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+			result.ExitCode = status.ExitStatus()
+		} else {
+			result.ExitCode = -1
+		}
+		result.Error = err
+	} else {
+		result.ExitCode = 0
+	}
+
+	// Get resource usage from Docker
+	s.updateResourceUsage(result)
+
+	return result, nil
+}
+
+// runInProcess executes a command using process-level isolation (fallback).
+func (s *Sandbox) runInProcess(ctx context.Context, name string, args []string) (*Result, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 
 	// Set working directory
@@ -129,9 +375,6 @@ func (s *Sandbox) Run(ctx context.Context, name string, args ...string) (*Result
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
-
-	// Start timing
-	startTime := time.Now()
 
 	// Start command
 	if err := cmd.Start(); err != nil {
@@ -163,12 +406,10 @@ func (s *Sandbox) Run(ctx context.Context, name string, args ...string) (*Result
 
 	// Wait for completion
 	err = cmd.Wait()
-	duration := time.Since(startTime)
 
 	result := &Result{
-		Stdout:   stdoutData,
-		Stderr:   stderrData,
-		Duration: duration,
+		Stdout: stdoutData,
+		Stderr: stderrData,
 	}
 
 	// Check for timeout
@@ -190,6 +431,67 @@ func (s *Sandbox) Run(ctx context.Context, name string, args ...string) (*Result
 	}
 
 	return result, nil
+}
+
+// updateResourceUsage updates resource usage from Docker stats.
+func (s *Sandbox) updateResourceUsage(result *Result) {
+	if !s.config.UseDocker || s.containerID == "" {
+		return
+	}
+
+	// Get Docker stats
+	cmd := exec.Command("docker", "stats", "--no-stream", "--format", "{{.MemUsage}}|{{.CPUPerc}}", s.containerID)
+	output, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(output)), "|")
+	if len(parts) >= 2 {
+		result.MemoryUsed = parseMemoryUsage(parts[0])
+		result.CPUUsed = parseCPUPercent(parts[1])
+	}
+}
+
+// parseMemoryUsage parses Docker memory usage string.
+func parseMemoryUsage(memStr string) int64 {
+	memStr = strings.TrimSpace(memStr)
+	// Format: "100MiB / 1GiB" or "100MB / 1GB"
+	parts := strings.Split(memStr, "/")
+	if len(parts) == 0 {
+		return 0
+	}
+
+	usage := strings.TrimSpace(parts[0])
+	var multiplier int64 = 1
+
+	if strings.Contains(usage, "GiB") || strings.Contains(usage, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		usage = strings.ReplaceAll(usage, "GiB", "")
+		usage = strings.ReplaceAll(usage, "GB", "")
+	} else if strings.Contains(usage, "MiB") || strings.Contains(usage, "MB") {
+		multiplier = 1024 * 1024
+		usage = strings.ReplaceAll(usage, "MiB", "")
+		usage = strings.ReplaceAll(usage, "MB", "")
+	} else if strings.Contains(usage, "KiB") || strings.Contains(usage, "KB") {
+		multiplier = 1024
+		usage = strings.ReplaceAll(usage, "KiB", "")
+		usage = strings.ReplaceAll(usage, "KB", "")
+	}
+
+	var val float64
+	fmt.Sscanf(strings.TrimSpace(usage), "%f", &val)
+	return int64(val * float64(multiplier))
+}
+
+// parseCPUPercent parses Docker CPU percentage string.
+func parseCPUPercent(cpuStr string) float64 {
+	cpuStr = strings.TrimSpace(cpuStr)
+	cpuStr = strings.TrimSuffix(cpuStr, "%")
+
+	var val float64
+	fmt.Sscanf(cpuStr, "%f", &val)
+	return val
 }
 
 // RunScript executes a script in the sandbox.
@@ -264,22 +566,33 @@ func (s *Sandbox) Kill() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Kill process group
-	if s.config.TempDir != "" {
-		// Clean up temp directory
-		return os.RemoveAll(s.config.TempDir)
+	// Stop Docker container if using Docker
+	if s.config.UseDocker && s.containerID != "" {
+		cmd := exec.Command("docker", "stop", s.containerID)
+		cmd.Run()
+		s.containerID = ""
+	}
+
+	// Clean up temp directory
+	if s.tempDir != "" {
+		return os.RemoveAll(s.tempDir)
 	}
 	return nil
 }
 
 // GetWorkDir returns the working directory.
 func (s *Sandbox) GetWorkDir() string {
-	return s.config.WorkDir
+	return s.workDir
 }
 
 // GetTempDir returns the temp directory.
 func (s *Sandbox) GetTempDir() string {
-	return s.config.TempDir
+	return s.tempDir
+}
+
+// GetContainerID returns the Docker container ID if using Docker.
+func (s *Sandbox) GetContainerID() string {
+	return s.containerID
 }
 
 // SetWorkDir sets the working directory.
@@ -287,7 +600,7 @@ func (s *Sandbox) SetWorkDir(dir string) error {
 	if _, err := os.Stat(dir); err != nil {
 		return err
 	}
-	s.config.WorkDir = dir
+	s.workDir = dir
 	return nil
 }
 
@@ -301,13 +614,14 @@ func (s *Sandbox) WriteFile(path string, data []byte, perm os.FileMode) error {
 	// Ensure path is within allowed directories
 	fullPath := path
 	if !filepath.IsAbs(path) {
-		fullPath = filepath.Join(s.config.WorkDir, path)
+		fullPath = filepath.Join(s.workDir, path)
 	}
 
 	if !s.isPathAllowed(fullPath) {
 		return fmt.Errorf("path not allowed: %s", path)
 	}
 
+	// If using Docker, write to the mounted directory
 	return os.WriteFile(fullPath, data, perm)
 }
 
@@ -319,7 +633,7 @@ func (s *Sandbox) ReadFile(path string) ([]byte, error) {
 
 	fullPath := path
 	if !filepath.IsAbs(path) {
-		fullPath = filepath.Join(s.config.WorkDir, path)
+		fullPath = filepath.Join(s.workDir, path)
 	}
 
 	if !s.isPathAllowed(fullPath) {
@@ -337,7 +651,7 @@ func (s *Sandbox) ListFiles(path string) ([]string, error) {
 
 	fullPath := path
 	if !filepath.IsAbs(path) {
-		fullPath = filepath.Join(s.config.WorkDir, path)
+		fullPath = filepath.Join(s.workDir, path)
 	}
 
 	if !s.isPathAllowed(fullPath) {
@@ -356,13 +670,71 @@ func (s *Sandbox) ListFiles(path string) ([]string, error) {
 	return names, nil
 }
 
-// Cleanup removes all temporary files.
+// CopyToContainer copies a file from host to Docker container.
+func (s *Sandbox) CopyToContainer(hostPath, containerPath string) error {
+	if !s.config.UseDocker || s.containerID == "" {
+		return fmt.Errorf("not using Docker")
+	}
+
+	cmd := exec.Command("docker", "cp", hostPath, fmt.Sprintf("%s:%s", s.containerID, containerPath))
+	return cmd.Run()
+}
+
+// CopyFromContainer copies a file from Docker container to host.
+func (s *Sandbox) CopyFromContainer(containerPath, hostPath string) error {
+	if !s.config.UseDocker || s.containerID == "" {
+		return fmt.Errorf("not using Docker")
+	}
+
+	cmd := exec.Command("docker", "cp", fmt.Sprintf("%s:%s", s.containerID, containerPath), hostPath)
+	return cmd.Run()
+}
+
+// GetDockerLogs gets logs from the Docker container.
+func (s *Sandbox) GetDockerLogs(tail int) ([]byte, error) {
+	if !s.config.UseDocker || s.containerID == "" {
+		return nil, fmt.Errorf("not using Docker")
+	}
+
+	args := []string{"logs", s.containerID}
+	if tail > 0 {
+		args = append(args, "--tail", fmt.Sprintf("%d", tail))
+	}
+
+	cmd := exec.Command("docker", args...)
+	return cmd.Output()
+}
+
+// ExecInContainer executes a command in the running container and returns output.
+func (s *Sandbox) ExecInContainer(cmdArgs ...string) ([]byte, error) {
+	if !s.config.UseDocker || s.containerID == "" {
+		return nil, fmt.Errorf("not using Docker")
+	}
+
+	args := append([]string{"exec", s.containerID}, cmdArgs...)
+	cmd := exec.Command("docker", args...)
+	return cmd.Output()
+}
+
+// Cleanup removes all temporary files and stops Docker container.
 func (s *Sandbox) Cleanup() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.config.TempDir != "" {
-		return os.RemoveAll(s.config.TempDir)
+	// Stop Docker container if using Docker
+	if s.config.UseDocker && s.containerID != "" {
+		cmd := exec.Command("docker", "stop", s.containerID)
+		if err := cmd.Run(); err != nil {
+			// Force remove if stop fails
+			cmd = exec.Command("docker", "rm", "-f", s.containerID)
+			cmd.Run()
+		}
+		s.containerID = ""
+	}
+
+	// Clean up temp directory
+	if s.tempDir != "" {
+		return os.RemoveAll(s.tempDir)
 	}
 	return nil
 }
@@ -388,9 +760,8 @@ func (s *Sandbox) filterEnv() []string {
 	if len(s.config.EnvWhitelist) == 0 {
 		// No whitelist means minimal safe environment
 		return []string{
-			"PATH=" + os.Getenv("PATH"),
-			"HOME=" + s.config.TempDir,
-			"USER=" + os.Getenv("USER"),
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"HOME=/tmp",
 		}
 	}
 
@@ -415,10 +786,10 @@ func (s *Sandbox) isPathAllowed(path string) bool {
 		return false
 	case FileAccessReadOnly:
 		// Allow reading from workdir and tempdir
-		return strings.HasPrefix(absPath, s.config.WorkDir) ||
-			strings.HasPrefix(absPath, s.config.TempDir)
+		return strings.HasPrefix(absPath, s.workDir) ||
+			strings.HasPrefix(absPath, s.tempDir)
 	case FileAccessWorkDirOnly:
-		return strings.HasPrefix(absPath, s.config.WorkDir)
+		return strings.HasPrefix(absPath, s.workDir)
 	case FileAccessFull:
 		// Still block some sensitive paths
 		blocked := []string{"/etc/passwd", "/etc/shadow", "/root", "/boot"}
@@ -489,6 +860,7 @@ func GetRuntimeInfo() RuntimeInfo {
 		Arch:     runtime.GOARCH,
 		NumCPU:   runtime.NumCPU(),
 		NumGorun: runtime.NumGoroutine(),
+		Docker:   isDockerAvailable(),
 	}
 }
 
@@ -498,29 +870,81 @@ type RuntimeInfo struct {
 	Arch     string
 	NumCPU   int
 	NumGorun int
+	Docker   bool
 }
 
-// DefaultConfig returns a safe default configuration.
+// DefaultConfig returns a safe default configuration with Docker enabled.
 func DefaultConfig() *Config {
 	return &Config{
 		Timeout:       30 * time.Second,
 		MemoryLimit:   512 * 1024 * 1024, // 512MB
+		CPULimit:      1.0,               // 1 CPU core
 		NetworkAccess: false,
 		FileAccess:    FileAccessWorkDirOnly,
 		MaxOutputSize: 10 * 1024 * 1024, // 10MB
 		AllowedCmds:   []string{"ls", "cat", "grep", "find", "go", "python3", "node", "npm"},
+		UseDocker:     true,
+		DockerImage:   "alpine:latest",
 	}
 }
 
-// SecureConfig returns a highly restrictive configuration.
+// SecureConfig returns a highly restrictive configuration with Docker.
 func SecureConfig() *Config {
 	return &Config{
 		Timeout:       10 * time.Second,
 		MemoryLimit:   128 * 1024 * 1024, // 128MB
+		CPULimit:      0.5,               // 0.5 CPU core
 		NetworkAccess: false,
 		FileAccess:    FileAccessWorkDirOnly,
 		MaxOutputSize: 1 * 1024 * 1024, // 1MB
 		AllowedCmds:   []string{"ls", "cat", "grep"},
 		EnvWhitelist:  []string{"PATH", "HOME"},
+		UseDocker:     true,
+		DockerImage:   "alpine:latest",
 	}
+}
+
+// ContainerInfo returns information about the sandbox container.
+type ContainerInfo struct {
+	ID           string `json:"id"`
+	Image        string `json:"image"`
+	MemoryLimit  int64  `json:"memory_limit"`
+	CPULimit     float64 `json:"cpu_limit"`
+	NetworkAccess bool  `json:"network_access"`
+	WorkDir      string `json:"work_dir"`
+}
+
+// GetContainerInfo returns information about the current container.
+func (s *Sandbox) GetContainerInfo() *ContainerInfo {
+	return &ContainerInfo{
+		ID:            s.containerID,
+		Image:         s.config.DockerImage,
+		MemoryLimit:   s.config.MemoryLimit,
+		CPULimit:      s.config.CPULimit,
+		NetworkAccess: s.config.NetworkAccess,
+		WorkDir:       s.workDir,
+	}
+}
+
+// InspectContainer returns detailed container information from Docker.
+func (s *Sandbox) InspectContainer() (map[string]interface{}, error) {
+	if !s.config.UseDocker || s.containerID == "" {
+		return nil, fmt.Errorf("not using Docker")
+	}
+
+	cmd := exec.Command("docker", "inspect", s.containerID)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var result []map[string]interface{}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, err
+	}
+
+	if len(result) > 0 {
+		return result[0], nil
+	}
+	return nil, fmt.Errorf("no container info found")
 }
